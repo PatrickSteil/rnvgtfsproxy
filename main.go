@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha1"
@@ -19,7 +20,10 @@ import (
 	"syscall"
 	"time"
 
+	gtfsrt "github.com/MobilityData/gtfs-realtime-bindings/golang/gtfs"
 	"github.com/joho/godotenv"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 type Config struct {
@@ -33,8 +37,8 @@ type Config struct {
 }
 
 type TokenCache struct {
-	AccessToken string
-	Expiry      time.Time
+	accessToken string
+	expiry      time.Time
 	mu          sync.Mutex
 }
 
@@ -43,8 +47,11 @@ type TokenResponse struct {
 	ExpiresIn   int    `json:"expires_in,string"`
 }
 
+// FeedEntry holds both raw and pre-compressed representations of a feed.
+// Pre-compressing once at write time avoids redundant gzip work per request.
 type FeedEntry struct {
 	Data        []byte
+	GzipData    []byte // pre-compressed; nil if compression failed
 	LastUpdate  time.Time
 	ETag        string
 	ContentType string
@@ -56,19 +63,50 @@ type FeedCache struct {
 	mu   sync.RWMutex
 }
 
-var config Config
-var tokenCache TokenCache
-var feedCache = FeedCache{data: make(map[string]*FeedEntry)}
-
-var endpoints = map[string]struct {
-	Path        string
-	ContentType string
-}{
-	"tripupdates.pb":   {"/tripupdates", "application/octet-stream"},
-	"alerts.pb":        {"/alerts", "application/octet-stream"},
-	"tripupdates.json": {"/tripupdates/decoded", "application/json"},
-	"alerts.json":      {"/alerts/decoded", "application/json"},
+// feedSource describes a single upstream protobuf endpoint and the cache keys
+// it populates. Each fetch produces two entries: one raw protobuf (.pb) and
+// one JSON-decoded (.json), so we only hit the upstream once per feed type.
+type feedSource struct {
+	path    string // upstream path, e.g. "/tripupdates"
+	pbKey   string // cache key for the protobuf entry
+	jsonKey string // cache key for the JSON entry
 }
+
+var feedSources = []feedSource{
+	{"/tripupdates", "tripupdates.pb", "tripupdates.json"},
+	{"/alerts", "alerts.pb", "alerts.json"},
+}
+
+var (
+	config     Config
+	tokenCache TokenCache
+	feedCache  = FeedCache{data: make(map[string]*FeedEntry)}
+
+	// httpClient is shared across all upstream fetches so TCP/TLS connections
+	// are reused between poll cycles.
+	httpClient = &http.Client{Timeout: 10 * time.Second}
+
+	// pjson marshals proto messages to JSON using proto field names (snake_case)
+	// and omitting unpopulated fields for a clean output.
+	pjson = protojson.MarshalOptions{
+		UseProtoNames:   true,
+		EmitUnpopulated: false,
+	}
+)
+
+// allCacheKeys returns the full set of cache keys produced by feedSources,
+// used for health-check completeness validation.
+func allCacheKeys() []string {
+	keys := make([]string, 0, len(feedSources)*2)
+	for _, s := range feedSources {
+		keys = append(keys, s.pbKey, s.jsonKey)
+	}
+	return keys
+}
+
+// maxFeedAge is the threshold beyond which a feed is considered stale for
+// health-check purposes.
+const maxFeedAge = 2 * time.Minute
 
 func loadConfig() Config {
 	_ = godotenv.Load()
@@ -91,6 +129,25 @@ func loadConfig() Config {
 	}
 }
 
+func validateConfig(c Config) error {
+	var missing []string
+	for _, pair := range []struct{ name, val string }{
+		{"TENANT_ID", c.TenantID},
+		{"CLIENT_ID", c.ClientID},
+		{"CLIENT_SECRET", c.ClientSecret},
+		{"RESOURCE", c.Resource},
+		{"HOSTNAME", c.Hostname},
+	} {
+		if pair.val == "" {
+			missing = append(missing, pair.name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 func getEnv(k, fallback string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -98,25 +155,21 @@ func getEnv(k, fallback string) string {
 	return fallback
 }
 
-func extractEntityCountJSON(data []byte) int {
-	var parsed map[string]interface{}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return -1
-	}
-	entities, ok := parsed["entity"].([]interface{})
-	if !ok {
-		return -1
-	}
-	return len(entities)
-}
-
+// getAccessToken returns a valid bearer token, refreshing via OAuth2 client
+// credentials when the cached token is within 60s of expiry.
+//
+// The mutex is held only for the cache read/write, not across the HTTP call,
+// so concurrent callers may briefly race to refresh — a harmless thundering
+// herd for a low-cardinality poller like this. If stricter single-flight
+// behaviour is needed, use golang.org/x/sync/singleflight.
 func getAccessToken() (string, error) {
 	tokenCache.mu.Lock()
-	defer tokenCache.mu.Unlock()
-
-	if tokenCache.AccessToken != "" && time.Now().Before(tokenCache.Expiry.Add(-60*time.Second)) {
-		return tokenCache.AccessToken, nil
+	if tokenCache.accessToken != "" && time.Now().Before(tokenCache.expiry.Add(-60*time.Second)) {
+		tok := tokenCache.accessToken
+		tokenCache.mu.Unlock()
+		return tok, nil
 	}
+	tokenCache.mu.Unlock()
 
 	url := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/token", config.TenantID)
 	resp, err := http.PostForm(url, map[string][]string{
@@ -132,95 +185,174 @@ func getAccessToken() (string, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("token request failed: %s", string(body))
+		return "", fmt.Errorf("token request failed (%d): %s", resp.StatusCode, string(body))
 	}
 
 	var tr TokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
-		return "", err
+		return "", fmt.Errorf("decode token response: %w", err)
 	}
 
-	tokenCache.AccessToken = tr.AccessToken
-	tokenCache.Expiry = time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second)
-	return tokenCache.AccessToken, nil
+	tokenCache.mu.Lock()
+	tokenCache.accessToken = tr.AccessToken
+	tokenCache.expiry = time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second)
+	tokenCache.mu.Unlock()
+
+	return tr.AccessToken, nil
 }
 
-func fetch(endpoint string) ([]byte, error) {
+func fetchFeed(endpoint string) ([]byte, error) {
 	token, err := getAccessToken()
 	if err != nil {
 		return nil, err
 	}
 
-	req, _ := http.NewRequest("GET", config.Hostname+endpoint, nil)
+	req, err := http.NewRequest(http.MethodGet, config.Hostname+endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("upstream %s: status %d: %s", endpoint, resp.StatusCode, string(body))
+	}
+
 	return io.ReadAll(resp.Body)
+}
+
+// pbToJSON unmarshals a GTFS-RT FeedMessage from protobuf wire format and
+// re-encodes it as JSON using protojson so field names and enum values match
+// the official GTFS-RT JSON representation.
+// Returns the JSON bytes and the number of entities in the message.
+func pbToJSON(pbData []byte) ([]byte, int, error) {
+	msg := &gtfsrt.FeedMessage{}
+	if err := proto.Unmarshal(pbData, msg); err != nil {
+		return nil, 0, fmt.Errorf("unmarshal protobuf: %w", err)
+	}
+
+	jsonData, err := pjson.Marshal(msg)
+	if err != nil {
+		return nil, 0, fmt.Errorf("marshal to JSON: %w", err)
+	}
+
+	return jsonData, len(msg.Entity), nil
 }
 
 func computeETag(data []byte) string {
 	hash := sha1.Sum(data)
-	return hex.EncodeToString(hash[:])
+	return `"` + hex.EncodeToString(hash[:]) + `"`
+}
+
+func compressGzip(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+
+	gz, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := gz.Write(data); err != nil {
+		gz.Close()
+		return nil, err
+	}
+
+	if err := gz.Close(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func makeCacheEntry(data []byte, contentType string, entityCount int) *FeedEntry {
+	entry := &FeedEntry{
+		Data:        data,
+		LastUpdate:  time.Now(),
+		ETag:        computeETag(data),
+		ContentType: contentType,
+		EntityCount: entityCount,
+	}
+	if gz, err := compressGzip(data); err == nil {
+		entry.GzipData = gz
+	} else {
+		log.Printf("gzip compress: %v", err)
+	}
+	return entry
 }
 
 func updateFeeds(ctx context.Context) {
+	pollOnce()
+
+	ticker := time.NewTicker(config.PollInterval)
+	defer ticker.Stop()
+
 	for {
-		var wg sync.WaitGroup
-
-		for key, meta := range endpoints {
-			wg.Add(1)
-			go func(k string, m struct {
-				Path        string
-				ContentType string
-			}) {
-				defer wg.Done()
-
-				data, err := fetch(m.Path)
-				if err != nil {
-					log.Printf("poll error [%s]: %v", k, err)
-					return
-				}
-
-				entry := &FeedEntry{
-					Data:        data,
-					LastUpdate:  time.Now(),
-					ETag:        computeETag(data),
-					ContentType: m.ContentType,
-				}
-
-				if m.ContentType == "application/json" {
-					entry.EntityCount = extractEntityCountJSON(data)
-				} else {
-					entry.EntityCount = -1
-				}
-
-				feedCache.mu.Lock()
-				feedCache.data[k] = entry
-				feedCache.mu.Unlock()
-
-				if entry.EntityCount >= 0 {
-					log.Printf("[%s] entities=%d size=%dB", k, entry.EntityCount, len(data))
-				} else {
-					log.Printf("[%s] size=%dB (protobuf)", k, len(data))
-				}
-			}(key, meta)
-		}
-
-		wg.Wait()
-		log.Println("feeds updated")
-
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(config.PollInterval):
+		case <-ticker.C:
+			pollOnce()
 		}
 	}
+}
+
+func pollOnce() {
+	var wg sync.WaitGroup
+
+	for _, src := range feedSources {
+		wg.Add(1)
+		go func(s feedSource) {
+			defer wg.Done()
+
+			pbData, err := fetchFeed(s.path)
+			if err != nil {
+				log.Printf("poll error [%s]: %v", s.pbKey, err)
+				return
+			}
+
+			jsonData, entityCount, err := pbToJSON(pbData)
+			if err != nil {
+				log.Printf("decode error [%s]: %v", s.pbKey, err)
+				pbEntry := makeCacheEntry(pbData, "application/octet-stream", -1)
+				feedCache.mu.Lock()
+				feedCache.data[s.pbKey] = pbEntry
+				feedCache.mu.Unlock()
+				log.Printf("[%s] size=%dB gzip=%dB (protobuf only; JSON decode failed)",
+					s.pbKey, len(pbData), len(pbEntry.GzipData))
+				return
+			}
+
+			pbEntry := makeCacheEntry(pbData, "application/octet-stream", -1)
+			jsonEntry := makeCacheEntry(jsonData, "application/json", entityCount)
+
+			feedCache.mu.Lock()
+			feedCache.data[s.pbKey] = pbEntry
+			feedCache.data[s.jsonKey] = jsonEntry
+			feedCache.mu.Unlock()
+
+			log.Printf("[%s] size=%dB gzip=%dB (protobuf)", s.pbKey, len(pbData), len(pbEntry.GzipData))
+			log.Printf("[%s] entities=%d size=%dB gzip=%dB (json)", s.jsonKey, entityCount, len(jsonData), len(jsonEntry.GzipData))
+		}(src)
+	}
+
+	wg.Wait()
+	log.Println("feeds updated")
+}
+
+func acceptsGzip(r *http.Request) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		token := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+		if strings.EqualFold(token, "gzip") {
+			return true
+		}
+	}
+	return false
 }
 
 func serveFeed(key string) http.HandlerFunc {
@@ -232,7 +364,7 @@ func serveFeed(key string) http.HandlerFunc {
 		feedCache.mu.RUnlock()
 
 		if !ok {
-			http.Error(w, "No data yet", http.StatusServiceUnavailable)
+			http.Error(w, "feed not yet available", http.StatusServiceUnavailable)
 			return
 		}
 
@@ -241,37 +373,34 @@ func serveFeed(key string) http.HandlerFunc {
 			return
 		}
 
-		w.Header().Set("Content-Type", entry.ContentType)
-		w.Header().Set("ETag", entry.ETag)
-		w.Header().Set("Last-Modified", entry.LastUpdate.UTC().Format(http.TimeFormat))
-		w.Header().Set("Cache-Control", "public, max-age=5")
-
-		if acceptsGzip(r) {
-			w.Header().Set("Content-Encoding", "gzip")
-			if err := writeGzip(w, entry.Data); err != nil {
-				http.Error(w, "gzip error", http.StatusInternalServerError)
+		if ims := r.Header.Get("If-Modified-Since"); ims != "" {
+			if t, err := http.ParseTime(ims); err == nil && !entry.LastUpdate.After(t) {
+				w.WriteHeader(http.StatusNotModified)
 				return
 			}
+		}
+
+		h := w.Header()
+		h.Set("Content-Type", entry.ContentType)
+		h.Set("ETag", entry.ETag)
+		h.Set("Last-Modified", entry.LastUpdate.UTC().Format(http.TimeFormat))
+		h.Set("Cache-Control", fmt.Sprintf("public, max-age=5, stale-while-revalidate=%d",
+			int(config.PollInterval.Seconds())-5))
+		h.Set("Vary", "Accept-Encoding")
+
+		if acceptsGzip(r) && entry.GzipData != nil {
+			h.Set("Content-Encoding", "gzip")
+			h.Set("Content-Length", strconv.Itoa(len(entry.GzipData)))
+			w.WriteHeader(http.StatusOK)
+			w.Write(entry.GzipData)
 		} else {
+			h.Set("Content-Length", strconv.Itoa(len(entry.Data)))
+			w.WriteHeader(http.StatusOK)
 			w.Write(entry.Data)
 		}
 
-		log.Printf("%s %s %d %s", r.Method, r.URL.Path, http.StatusOK, time.Since(start))
+		log.Printf("%s %s 200 %s", r.Method, r.URL.Path, time.Since(start))
 	}
-}
-
-func acceptsGzip(r *http.Request) bool {
-	return strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
-}
-
-var gzipPool = sync.Pool{New: func() any { return gzip.NewWriter(nil) }}
-
-func writeGzip(w http.ResponseWriter, data []byte) error {
-	gz := gzipPool.Get().(*gzip.Writer)
-	defer gzipPool.Put(gz)
-	gz.Reset(w)
-	_, err := gz.Write(data)
-	return errors.Join(err, gz.Close())
 }
 
 func statusHandler(w http.ResponseWriter, r *http.Request) {
@@ -283,8 +412,10 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		out[k] = map[string]interface{}{
 			"last_update": v.LastUpdate,
 			"etag":        v.ETag,
-			"size":        len(v.Data),
+			"size_bytes":  len(v.Data),
+			"gzip_bytes":  len(v.GzipData),
 			"entities":    v.EntityCount,
+			"stale":       time.Since(v.LastUpdate) > maxFeedAge,
 		}
 	}
 	feedCache.mu.RUnlock()
@@ -296,15 +427,27 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	feedCache.mu.RLock()
 	defer feedCache.mu.RUnlock()
 
-	if len(feedCache.data) == 0 {
-		http.Error(w, "not ready", http.StatusServiceUnavailable)
-		return
+	for _, k := range allCacheKeys() {
+		v, ok := feedCache.data[k]
+		if !ok {
+			http.Error(w, fmt.Sprintf("not ready: feed %q not yet populated", k), http.StatusServiceUnavailable)
+			return
+		}
+		if time.Since(v.LastUpdate) > maxFeedAge {
+			http.Error(w, fmt.Sprintf("not ready: feed %q is stale", k), http.StatusServiceUnavailable)
+			return
+		}
 	}
+
+	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
 }
 
 func main() {
 	config = loadConfig()
+	if err := validateConfig(config); err != nil {
+		log.Fatalf("configuration error: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -312,21 +455,28 @@ func main() {
 	go updateFeeds(ctx)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/tripupdates.pb", serveFeed("tripupdates.pb"))
-	mux.HandleFunc("/alerts.pb", serveFeed("alerts.pb"))
-	mux.HandleFunc("/tripupdates.json", serveFeed("tripupdates.json"))
-	mux.HandleFunc("/alerts.json", serveFeed("alerts.json"))
+
+	for _, src := range feedSources {
+		pbKey := src.pbKey
+		jsonKey := src.jsonKey
+		mux.HandleFunc("/"+pbKey, serveFeed(pbKey))
+		mux.HandleFunc("/"+jsonKey, serveFeed(jsonKey))
+	}
+
 	mux.HandleFunc("/status", statusHandler)
 	mux.HandleFunc("/healthz", healthHandler)
 
 	server := &http.Server{
-		Addr:    ":" + config.Port,
-		Handler: mux,
+		Addr:         ":" + config.Port,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {
-		log.Printf("server running on :%s\n", config.Port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("server running on :%s", config.Port)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
 	}()
@@ -336,7 +486,6 @@ func main() {
 	<-stop
 
 	log.Println("shutting down...")
-
 	ctxShutdown, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
 	server.Shutdown(ctxShutdown)
