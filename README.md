@@ -4,8 +4,6 @@ A lightweight Go proxy for the [RNV](https://www.rnv-online.de/) (Rhein-Neckar-V
 
 The RNV real-time API requires OAuth2 client credentials authentication. This proxy handles the auth, polls the upstream GTFS-RT feeds on a configurable interval, caches them in memory, and re-exposes them over plain HTTP — so any GTFS-RT consumer can reach them without needing credentials.
 
----
-
 ## How it works
 
 ```
@@ -18,8 +16,6 @@ RNV API (OAuth2)          rnvgtfsproxy                Your app
 ```
 
 On startup the proxy fetches all feeds immediately, then re-fetches on every poll interval. Feeds are stored compressed; responses are served directly from the pre-compressed cache with proper HTTP caching headers.
-
----
 
 ## Endpoints
 
@@ -41,8 +37,6 @@ All feed endpoints return:
 - `Cache-Control: public, max-age=5, stale-while-revalidate=<interval-5>`
 - `Vary: Accept-Encoding`
 - `Content-Encoding: gzip` when the client sends `Accept-Encoding: gzip`
-
----
 
 ## Setup
 
@@ -80,19 +74,9 @@ Or in one step:
 go run .
 ```
 
----
-
 ## GTFS-RT
 
 The proxy serves feeds conforming to the [GTFS Realtime specification](https://gtfs.org/realtime/reference/). Protobuf endpoints (`.pb`) are the canonical binary format; JSON endpoints (`.json`) are the same data decoded for easier inspection and debugging.
-
-Useful tools for working with the feeds:
-
-- [`gtfs-realtime-bindings`](https://github.com/MobilityData/gtfs-realtime-bindings) — official language bindings for decoding protobuf
-- [`proto-lens`](https://github.com/google/proto-lens) — CLI for inspecting `.pb` files
-- `curl -s http://localhost:8000/tripupdates.json | jq '.entity | length'` — quick entity count
-
----
 
 ## Licence
 
