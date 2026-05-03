@@ -47,11 +47,9 @@ type TokenResponse struct {
 	ExpiresIn   int    `json:"expires_in,string"`
 }
 
-// FeedEntry holds both raw and pre-compressed representations of a feed.
-// Pre-compressing once at write time avoids redundant gzip work per request.
 type FeedEntry struct {
 	Data        []byte
-	GzipData    []byte // pre-compressed; nil if compression failed
+	GzipData    []byte
 	LastUpdate  time.Time
 	ETag        string
 	ContentType string
@@ -63,13 +61,10 @@ type FeedCache struct {
 	mu   sync.RWMutex
 }
 
-// feedSource describes a single upstream protobuf endpoint and the cache keys
-// it populates. Each fetch produces two entries: one raw protobuf (.pb) and
-// one JSON-decoded (.json), so we only hit the upstream once per feed type.
 type feedSource struct {
-	path    string // upstream path, e.g. "/tripupdates"
-	pbKey   string // cache key for the protobuf entry
-	jsonKey string // cache key for the JSON entry
+	path    string
+	pbKey   string
+	jsonKey string
 }
 
 var feedSources = []feedSource{
@@ -82,20 +77,14 @@ var (
 	tokenCache TokenCache
 	feedCache  = FeedCache{data: make(map[string]*FeedEntry)}
 
-	// httpClient is shared across all upstream fetches so TCP/TLS connections
-	// are reused between poll cycles.
 	httpClient = &http.Client{Timeout: 10 * time.Second}
 
-	// pjson marshals proto messages to JSON using proto field names (snake_case)
-	// and omitting unpopulated fields for a clean output.
 	pjson = protojson.MarshalOptions{
 		UseProtoNames:   true,
 		EmitUnpopulated: false,
 	}
 )
 
-// allCacheKeys returns the full set of cache keys produced by feedSources,
-// used for health-check completeness validation.
 func allCacheKeys() []string {
 	keys := make([]string, 0, len(feedSources)*2)
 	for _, s := range feedSources {
@@ -104,8 +93,6 @@ func allCacheKeys() []string {
 	return keys
 }
 
-// maxFeedAge is the threshold beyond which a feed is considered stale for
-// health-check purposes.
 const maxFeedAge = 2 * time.Minute
 
 func loadConfig() Config {
@@ -155,13 +142,6 @@ func getEnv(k, fallback string) string {
 	return fallback
 }
 
-// getAccessToken returns a valid bearer token, refreshing via OAuth2 client
-// credentials when the cached token is within 60s of expiry.
-//
-// The mutex is held only for the cache read/write, not across the HTTP call,
-// so concurrent callers may briefly race to refresh — a harmless thundering
-// herd for a low-cardinality poller like this. If stricter single-flight
-// behaviour is needed, use golang.org/x/sync/singleflight.
 func getAccessToken() (string, error) {
 	tokenCache.mu.Lock()
 	if tokenCache.accessToken != "" && time.Now().Before(tokenCache.expiry.Add(-60*time.Second)) {
@@ -227,10 +207,6 @@ func fetchFeed(endpoint string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// pbToJSON unmarshals a GTFS-RT FeedMessage from protobuf wire format and
-// re-encodes it as JSON using protojson so field names and enum values match
-// the official GTFS-RT JSON representation.
-// Returns the JSON bytes and the number of entities in the message.
 func pbToJSON(pbData []byte) ([]byte, int, error) {
 	msg := &gtfsrt.FeedMessage{}
 	if err := proto.Unmarshal(pbData, msg); err != nil {
