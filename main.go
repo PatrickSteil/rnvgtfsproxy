@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -39,7 +39,7 @@ type Config struct {
 type TokenCache struct {
 	accessToken string
 	expiry      time.Time
-	mu          sync.Mutex
+	mu          sync.RWMutex
 }
 
 type TokenResponse struct {
@@ -143,16 +143,23 @@ func getEnv(k, fallback string) string {
 }
 
 func getAccessToken() (string, error) {
-	tokenCache.mu.Lock()
+	tokenCache.mu.RLock()
 	if tokenCache.accessToken != "" && time.Now().Before(tokenCache.expiry.Add(-60*time.Second)) {
 		tok := tokenCache.accessToken
-		tokenCache.mu.Unlock()
+		tokenCache.mu.RUnlock()
 		return tok, nil
 	}
-	tokenCache.mu.Unlock()
+	tokenCache.mu.RUnlock()
+
+	tokenCache.mu.Lock()
+	defer tokenCache.mu.Unlock()
+
+	if tokenCache.accessToken != "" && time.Now().Before(tokenCache.expiry.Add(-60*time.Second)) {
+		return tokenCache.accessToken, nil
+	}
 
 	url := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/token", config.TenantID)
-	resp, err := http.PostForm(url, map[string][]string{
+	resp, err := httpClient.PostForm(url, map[string][]string{
 		"grant_type":    {"client_credentials"},
 		"client_id":     {config.ClientID},
 		"client_secret": {config.ClientSecret},
@@ -173,12 +180,10 @@ func getAccessToken() (string, error) {
 		return "", fmt.Errorf("decode token response: %w", err)
 	}
 
-	tokenCache.mu.Lock()
 	tokenCache.accessToken = tr.AccessToken
 	tokenCache.expiry = time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second)
-	tokenCache.mu.Unlock()
 
-	return tr.AccessToken, nil
+	return tokenCache.accessToken, nil
 }
 
 func fetchFeed(endpoint string) ([]byte, error) {
@@ -222,7 +227,7 @@ func pbToJSON(pbData []byte) ([]byte, int, error) {
 }
 
 func computeETag(data []byte) string {
-	hash := sha1.Sum(data)
+	hash := sha256.Sum256(data)
 	return `"` + hex.EncodeToString(hash[:]) + `"`
 }
 
@@ -295,7 +300,7 @@ func pollOnce() {
 			jsonData, entityCount, err := pbToJSON(pbData)
 			if err != nil {
 				log.Printf("decode error [%s]: %v", s.pbKey, err)
-				pbEntry := makeCacheEntry(pbData, "application/octet-stream", -1)
+				pbEntry := makeCacheEntry(pbData, "application/x-protobuf", -1)
 				feedCache.mu.Lock()
 				feedCache.data[s.pbKey] = pbEntry
 				feedCache.mu.Unlock()
@@ -304,7 +309,7 @@ func pollOnce() {
 				return
 			}
 
-			pbEntry := makeCacheEntry(pbData, "application/octet-stream", -1)
+			pbEntry := makeCacheEntry(pbData, "application/x-protobuf", -1)
 			jsonEntry := makeCacheEntry(jsonData, "application/json", entityCount)
 
 			feedCache.mu.Lock()
@@ -335,6 +340,11 @@ func serveFeed(key string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
 		feedCache.mu.RLock()
 		entry, ok := feedCache.data[key]
 		feedCache.mu.RUnlock()
@@ -360,19 +370,24 @@ func serveFeed(key string) http.HandlerFunc {
 		h.Set("Content-Type", entry.ContentType)
 		h.Set("ETag", entry.ETag)
 		h.Set("Last-Modified", entry.LastUpdate.UTC().Format(http.TimeFormat))
-		h.Set("Cache-Control", fmt.Sprintf("public, max-age=5, stale-while-revalidate=%d",
-			int(config.PollInterval.Seconds())-5))
+		swr := int(config.PollInterval.Seconds()) - 5
+		if swr < 0 {
+			swr = 0
+		}
+		h.Set("Cache-Control", fmt.Sprintf("public, max-age=5, stale-while-revalidate=%d", swr))
 		h.Set("Vary", "Accept-Encoding")
 
 		if acceptsGzip(r) && entry.GzipData != nil {
 			h.Set("Content-Encoding", "gzip")
 			h.Set("Content-Length", strconv.Itoa(len(entry.GzipData)))
-			w.WriteHeader(http.StatusOK)
-			w.Write(entry.GzipData)
+			if _, err := w.Write(entry.GzipData); err != nil {
+				log.Printf("write error: %v", err)
+			}
 		} else {
 			h.Set("Content-Length", strconv.Itoa(len(entry.Data)))
-			w.WriteHeader(http.StatusOK)
-			w.Write(entry.Data)
+			if _, err := w.Write(entry.Data); err != nil {
+				log.Printf("write error: %v", err)
+			}
 		}
 
 		log.Printf("%s %s 200 %s", r.Method, r.URL.Path, time.Since(start))
