@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,13 +29,157 @@ import (
 )
 
 type Config struct {
-	TenantID     string
-	ClientID     string
-	ClientSecret string
-	Resource     string
-	Hostname     string
-	PollInterval time.Duration
-	Port         string
+	TenantID       string
+	ClientID       string
+	ClientSecret   string
+	Resource       string
+	Hostname       string
+	PollInterval   time.Duration
+	Port           string
+	RateLimitRPS   float64 // requests per second per IP
+	RateLimitBurst int     // burst size per IP
+}
+
+type ipBucket struct {
+	tokens    float64
+	lastRefil time.Time
+}
+
+type RateLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*ipBucket
+	rps     float64
+	burst   float64
+}
+
+func newRateLimiter(rps float64, burst int) *RateLimiter {
+	rl := &RateLimiter{
+		buckets: make(map[string]*ipBucket),
+		rps:     rps,
+		burst:   float64(burst),
+	}
+	go func() {
+		for range time.Tick(5 * time.Minute) {
+			rl.mu.Lock()
+			cutoff := time.Now().Add(-10 * time.Minute)
+			for ip, b := range rl.buckets {
+				if b.lastRefil.Before(cutoff) {
+					delete(rl.buckets, ip)
+				}
+			}
+			rl.mu.Unlock()
+		}
+	}()
+	return rl
+}
+
+func (rl *RateLimiter) allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	b, ok := rl.buckets[ip]
+	if !ok {
+		rl.buckets[ip] = &ipBucket{tokens: rl.burst - 1, lastRefil: now}
+		return true
+	}
+
+	elapsed := now.Sub(b.lastRefil).Seconds()
+	b.tokens += elapsed * rl.rps
+	if b.tokens > rl.burst {
+		b.tokens = rl.burst
+	}
+	b.lastRefil = now
+
+	if b.tokens >= 1 {
+		b.tokens--
+		return true
+	}
+	return false
+}
+
+func rateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := remoteIP(r)
+		if !rl.allow(ip) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			log.Printf("rate limited %s %s from %s", r.Method, r.URL.Path, ip)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func remoteIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if ip, _, err := net.SplitHostPort(strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])); err == nil {
+			return ip
+		}
+		return strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])
+	}
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return ip
+}
+
+func validationMiddleware(next http.Handler) http.Handler {
+	// Feed endpoints only accept these content types in Accept headers.
+	feedPaths := map[string]bool{}
+	for _, s := range feedSources {
+		feedPaths["/"+s.pbKey] = true
+		feedPaths["/"+s.jsonKey] = true
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			// allowed
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if len(r.URL.Path) > 128 {
+			http.Error(w, "request path too long", http.StatusBadRequest)
+			return
+		}
+
+		if strings.Contains(r.URL.Path, "..") || strings.Contains(r.URL.Path, "//") {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
+
+		if feedPaths[r.URL.Path] && r.Method == http.MethodGet {
+			accept := r.Header.Get("Accept")
+			if accept != "" && !acceptableFeedAccept(accept) {
+				http.Error(w, "not acceptable", http.StatusNotAcceptable)
+				return
+			}
+		}
+
+		if r.ContentLength > 0 {
+			http.Error(w, "request body not allowed", http.StatusBadRequest)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func acceptableFeedAccept(accept string) bool {
+	for _, part := range strings.Split(accept, ",") {
+		mt := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+		switch mt {
+		case "*/*", "application/*",
+			"application/json", "application/x-protobuf",
+			"application/octet-stream":
+			return true
+		}
+	}
+	return false
 }
 
 type TokenCache struct {
@@ -105,14 +251,30 @@ func loadConfig() Config {
 		poll = 30
 	}
 
+	rpsStr := getEnv("RATE_LIMIT_RPS", "10")
+	rps, err := strconv.ParseFloat(rpsStr, 64)
+	if err != nil || rps <= 0 {
+		log.Printf("invalid RATE_LIMIT_RPS %q, using 10: %v", rpsStr, err)
+		rps = 10
+	}
+
+	burstStr := getEnv("RATE_LIMIT_BURST", "30")
+	burst, err := strconv.Atoi(burstStr)
+	if err != nil || burst <= 0 {
+		log.Printf("invalid RATE_LIMIT_BURST %q, using 30: %v", burstStr, err)
+		burst = 30
+	}
+
 	return Config{
-		TenantID:     os.Getenv("TENANT_ID"),
-		ClientID:     os.Getenv("CLIENT_ID"),
-		ClientSecret: os.Getenv("CLIENT_SECRET"),
-		Resource:     os.Getenv("RESOURCE"),
-		Hostname:     os.Getenv("HOSTNAME"),
-		PollInterval: time.Duration(poll) * time.Second,
-		Port:         getEnv("PORT", "8000"),
+		TenantID:       os.Getenv("TENANT_ID"),
+		ClientID:       os.Getenv("CLIENT_ID"),
+		ClientSecret:   os.Getenv("CLIENT_SECRET"),
+		Resource:       os.Getenv("RESOURCE"),
+		Hostname:       os.Getenv("HOSTNAME"),
+		PollInterval:   time.Duration(poll) * time.Second,
+		Port:           getEnv("PORT", "8000"),
+		RateLimitRPS:   rps,
+		RateLimitBurst: burst,
 	}
 }
 
@@ -340,11 +502,6 @@ func serveFeed(key string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
 		feedCache.mu.RLock()
 		entry, ok := feedCache.data[key]
 		feedCache.mu.RUnlock()
@@ -435,6 +592,9 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	noRateLimit := flag.Bool("no-rate-limit", false, "disable per-IP rate limiting")
+	flag.Parse()
+
 	config = loadConfig()
 	if err := validateConfig(config); err != nil {
 		log.Fatalf("configuration error: %v", err)
@@ -457,9 +617,19 @@ func main() {
 	mux.HandleFunc("/status", statusHandler)
 	mux.HandleFunc("/healthz", healthHandler)
 
+	var handler http.Handler
+	if *noRateLimit {
+		log.Println("rate limiter disabled")
+		handler = validationMiddleware(mux)
+	} else {
+		rl := newRateLimiter(config.RateLimitRPS, config.RateLimitBurst)
+		log.Printf("rate limiter: %.1f req/s per IP, burst %d", config.RateLimitRPS, config.RateLimitBurst)
+		handler = validationMiddleware(rateLimitMiddleware(rl, mux))
+	}
+
 	server := &http.Server{
 		Addr:         ":" + config.Port,
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,

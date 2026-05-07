@@ -57,9 +57,13 @@ RESOURCE=<API resource URI provided by RNV>
 HOSTNAME=https://<rnv-gtfs-api-host>
 POLL_INTERVAL=30      # seconds between upstream fetches (default: 30)
 PORT=8000             # port to listen on (default: 8000)
+
+# Rate limiter (optional)
+RATE_LIMIT_RPS=10     # sustained requests per second per IP (default: 10)
+RATE_LIMIT_BURST=30   # maximum burst size per IP (default: 30)
 ```
 
-All six of `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, `RESOURCE`, and `HOSTNAME` are required. The service will refuse to start if any are missing.
+The first five (`TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, `RESOURCE`, and `HOSTNAME`) are required. The service will refuse to start if any are missing.
 
 ### Build and run
 
@@ -73,6 +77,35 @@ Or in one step:
 ```bash
 go run .
 ```
+
+
+## Rate limiting
+ 
+The proxy includes a per-IP token bucket rate limiter. It runs as middleware before any request reaches a handler.
+ 
+Each client IP gets its own bucket that refills at `RATE_LIMIT_RPS` tokens per second up to a maximum of `RATE_LIMIT_BURST`. A request that arrives when the bucket is empty receives a `429 Too Many Requests` response with a `Retry-After: 1` header. The rate limiter honours `X-Forwarded-For` so it works correctly behind a reverse proxy.
+ 
+The defaults (10 req/s, burst 30) are intentionally generous — the feeds only update every `POLL_INTERVAL` seconds, so no legitimate consumer needs more than a handful of requests per minute. Tighten the limits if you are exposing the proxy publicly.
+ 
+To disable rate limiting entirely, pass the `-no-rate-limit` flag at startup:
+ 
+```bash
+./gtfs-proxy -no-rate-limit
+```
+ 
+This is useful in trusted internal environments or during load testing. The flag bypasses the rate limiter middleware completely; all other behaviour is unchanged.
+ 
+## Request validation
+ 
+All requests pass through a validation middleware before the rate limiter. It rejects:
+ 
+- Any method other than `GET`, `HEAD`, or `OPTIONS` → `405 Method Not Allowed`
+- Paths longer than 128 characters → `400 Bad Request`
+- Paths containing `..` or `//` → `400 Bad Request`
+- Requests to feed endpoints with an incompatible `Accept` header (e.g. `text/html`) → `406 Not Acceptable`
+- Requests carrying a non-empty body (`Content-Length > 0`) → `400 Bad Request`
+Accepted `Accept` values for feed endpoints: `*/*`, `application/*`, `application/json`, `application/x-protobuf`, `application/octet-stream`.
+
 
 ## GTFS-RT
 
